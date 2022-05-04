@@ -16,14 +16,14 @@ minimal_mistakes_skin    : "haxor" # "air", "aqua", "contrast", "dark", "dirt", 
 
 # Site Settings
 locale                   : "es-ES"
-title                    : "H4RTICX.io"
+title                    : "h4rticx.io"
 title_separator          : "-"
 name                     : "h4rticx"
 description              : "Posts about cibersecurity, hackthebox CTF and more"
 url                      : "https://h4rticx.io" # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
 baseurl                  : # the subpath of your site, e.g. "/blog"
 repository               : "h4rticx/h4rticx.github.io" # GitHub username/repo-name e.g. "mmistakes/minimal-mistakes"
-logo                     : "/assets/images/h4rticx.png"
+logo                     : "/assets/images/logo.png"
 teaser                   : # path of fallback teaser image, e.g. "/assets/images/500x300.png"
 breadcrumbs              : true # true, false (default)
 words_per_minute         : 200
