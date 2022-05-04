@@ -1,13 +1,13 @@
 ---
 layout: single
-title: TCP bind shellcode
-date: 2018-11-18
+title: HackTheBox test
+date: 2022-5-4
 classes: wide
 header:
   teaser: /assets/images/slae32.png
 categories:
   - slae
-  - infosec
+  - test
 tags:
   - slae
   - assembly
