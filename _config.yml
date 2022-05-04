@@ -23,7 +23,7 @@ description              : "Posts about cibersecurity, hackthebox CTF and more"
 url                      : "https://h4rticx.io" # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
 baseurl                  : # the subpath of your site, e.g. "/blog"
 repository               : "h4rticx/h4rticx.github.io" # GitHub username/repo-name e.g. "mmistakes/minimal-mistakes"
-logo                     : "/assets/images/arch.png"
+logo                     : "/assets/images/h4rticx.png"
 teaser                   : # path of fallback teaser image, e.g. "/assets/images/500x300.png"
 breadcrumbs              : true # true, false (default)
 words_per_minute         : 200
@@ -102,10 +102,10 @@ analytics:
 # Site Author
 author:
   name             : "H4rticx"
-  avatar           : "/assets/images/avatar.png"
+  avatar           : "/assets/images/arch.png"
   bio              : "Pentester, CTF player<br>HackTheBox No team yet"
   location         : "Spain"
-  email            : "info@h4rticx.io"
+  email            : "jorgerodridomi@gmail.com"
   uri              :
   home             : # null (default), "absolute or relative url to link to author home"
   bitbucket        :
@@ -117,10 +117,10 @@ author:
   github           : "h4rticx"
   gitlab           :
   google_plus      :
-  keybase          : "h4rticx"
+  keybase          : 
   instagram        :
   lastfm           :
-  linkedin         : # "john-doe-12345678" (the last part of your profile url, e.g. https://www.linkedin.com/in/john-doe-12345678)
+  linkedin         : "jorge-rodriguez-876118238" # "john-doe-12345678" (the last part of your profile url, e.g. https://www.linkedin.com/in/john-doe-12345678)
   pinterest        :
   soundcloud       :
   stackoverflow    : # "123456/username" (the last part of your profile url, e.g. https://stackoverflow.com/users/123456/username)
